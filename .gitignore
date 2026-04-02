@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+
+# Data (large files — do not commit)
+data/raw/
+data/keypoints/
+
+# Model checkpoints (large — use git-lfs or keep local)
+models/checkpoints/*.pth
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+training/logs/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
