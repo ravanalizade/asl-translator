@@ -9,6 +9,7 @@ dist/
 build/
 .venv/
 venv/
+docs/quickstart.md
 
 # Environment
 .env
