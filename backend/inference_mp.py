@@ -1,16 +1,11 @@
 """
 backend/inference_mp.py
 -----------------------
-Real-time inference pipeline using MediaPipe instead of RTMPose.
-
-Differences from inference.py:
-- Uses MediaPipe Hands instead of RTMPoseEstimator
-- Input dim: 126 (42 keypoints × 3) instead of 399
-- Loads ASLTransformerMP instead of ASLTransformer
-- Works on CPU without mmcv
+Real-time inference pipeline using MediaPipe Tasks API (v0.10+).
 """
 
 import os
+import urllib.request
 from collections import deque, Counter
 
 import cv2
@@ -18,28 +13,35 @@ import mediapipe as mp
 import numpy as np
 import torch
 
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
 from models.transformer_mp import load_checkpoint_mp, build_model_mp
 
 
+HAND_MODEL_PATH = 'models/hand_landmarker.task'
+HAND_MODEL_URL  = (
+    'https://storage.googleapis.com/mediapipe-models/'
+    'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+)
+
+
+def _download_hand_model():
+    if not os.path.exists(HAND_MODEL_PATH):
+        os.makedirs(os.path.dirname(HAND_MODEL_PATH), exist_ok=True)
+        print('[mediapipe] Downloading hand landmarker model...')
+        urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_PATH)
+        print('[mediapipe] Downloaded.')
+
+
 class InferencePipelineMP:
-    """
-    Stateful per-connection MediaPipe inference pipeline.
-
-    Args:
-        checkpoint_path: path to best_model_mp.pth
-        num_classes:     number of output classes
-        conf_threshold:  minimum confidence to emit prediction
-        vote_count:      consecutive windows needed to confirm a word
-        window_size:     frames per inference window (T=32)
-    """
-
-    NUM_HAND_KP  = 21
-    NUM_KEYPOINTS = 42     # 21 per hand × 2
-    FEATURE_DIM   = 126    # 42 × 3
+    NUM_HAND_KP   = 21
+    NUM_KEYPOINTS = 42
+    FEATURE_DIM   = 126
 
     def __init__(
         self,
-        checkpoint_path: str = "models/checkpoints_mp/best_model_mp.pth",
+        checkpoint_path: str = 'models/checkpoints_mp/best_model_mp.pth',
         num_classes: int = 100,
         conf_threshold: float = 0.6,
         vote_count: int = 3,
@@ -49,22 +51,25 @@ class InferencePipelineMP:
         self.conf_threshold = conf_threshold
         self.vote_count     = vote_count
         self.window_size    = window_size
-        self.device         = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device         = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-        # MediaPipe Hands
-        self.hands = mp.solutions.hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.3,
+        # MediaPipe Hands (Tasks API)
+        _download_hand_model()
+        base_options = mp_python.BaseOptions(model_asset_path=HAND_MODEL_PATH)
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=2,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
             min_tracking_confidence=0.3,
         )
-        self.mp_draw = mp.solutions.drawing_utils
+        self.hands = mp_vision.HandLandmarker.create_from_options(options)
 
         # Classifier
         if os.path.exists(checkpoint_path):
             self.model = load_checkpoint_mp(checkpoint_path, num_classes, self.device)
         else:
-            print(f"[warn] Checkpoint not found: {checkpoint_path} — using untrained model")
+            print(f'[warn] Checkpoint not found: {checkpoint_path} — using untrained model')
             self.model = build_model_mp(num_classes=num_classes, device=self.device)
         self.model.eval()
 
@@ -74,7 +79,7 @@ class InferencePipelineMP:
         self.word_buffer:  list  = []
         self.last_confirmed_word: str = None
 
-        print(f"[inference-mp] Ready on {self.device}")
+        print(f'[inference-mp] Ready on {self.device}')
 
     def reset(self):
         self.frame_buffer.clear()
@@ -83,28 +88,18 @@ class InferencePipelineMP:
         self.last_confirmed_word = None
 
     def process_frame(self, frame_bgr: np.ndarray, word_to_idx: dict) -> dict:
-        """
-        Process a single BGR frame.
-
-        Returns dict with:
-            current_word, confidence, confirmed_word,
-            word_buffer, skeleton_points
-        """
         idx_to_word = {v: k for k, v in word_to_idx.items()}
 
-        # Extract MediaPipe keypoints
         keypoints, skeleton_points = self._extract_keypoints(frame_bgr)
-
-        # Preprocess
         processed = self._preprocess_frame(keypoints)
         self.frame_buffer.append(processed)
 
         result = {
-            "current_word":   None,
-            "confidence":     None,
-            "confirmed_word": None,
-            "word_buffer":    list(self.word_buffer),
-            "skeleton_points": skeleton_points,
+            'current_word':    None,
+            'confidence':      None,
+            'confirmed_word':  None,
+            'word_buffer':     list(self.word_buffer),
+            'skeleton_points': skeleton_points,
         }
 
         if len(self.frame_buffer) < self.window_size:
@@ -112,8 +107,8 @@ class InferencePipelineMP:
 
         window = np.stack(list(self.frame_buffer), axis=0)  # (32, 126)
         word, confidence = self._classify_window(window, idx_to_word)
-        result["current_word"] = word
-        result["confidence"]   = confidence
+        result['current_word'] = word
+        result['confidence']   = confidence
 
         if word and confidence and confidence >= self.conf_threshold:
             self.vote_buffer.append(word)
@@ -124,58 +119,48 @@ class InferencePipelineMP:
         if confirmed and confirmed != self.last_confirmed_word:
             self.word_buffer.append(confirmed)
             self.last_confirmed_word = confirmed
-            result["confirmed_word"] = confirmed
-            result["word_buffer"]    = list(self.word_buffer)
+            result['confirmed_word'] = confirmed
+            result['word_buffer']    = list(self.word_buffer)
 
         return result
 
     def _extract_keypoints(self, frame_bgr: np.ndarray):
-        """
-        Run MediaPipe Hands on frame.
-        Returns:
-            keypoints: (42, 3)
-            skeleton_points: list of dicts for frontend overlay
-        """
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w      = frame_rgb.shape[:2]
-        results   = self.hands.process(frame_rgb)
+        mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        results   = self.hands.detect(mp_image)
 
         left_kp  = np.zeros((self.NUM_HAND_KP, 3), dtype=np.float32)
         right_kp = np.zeros((self.NUM_HAND_KP, 3), dtype=np.float32)
         skeleton_points = []
 
-        if results.multi_hand_landmarks and results.multi_handedness:
+        if results.hand_landmarks and results.handedness:
             for hand_landmarks, handedness in zip(
-                results.multi_hand_landmarks, results.multi_handedness
+                results.hand_landmarks, results.handedness
             ):
-                label = handedness.classification[0].label
+                label = handedness[0].category_name
                 kp    = np.array(
-                    [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark],
+                    [[lm.x, lm.y, lm.z] for lm in hand_landmarks],
                     dtype=np.float32,
                 )
-                if label == "Left":
+                if label == 'Left':
                     left_kp = kp
                 else:
                     right_kp = kp
 
-                for lm in hand_landmarks.landmark:
+                for lm in hand_landmarks:
                     skeleton_points.append({
-                        "x":      lm.x * w,
-                        "y":      lm.y * h,
-                        "score":  1.0,
-                        "region": "hands",
+                        'x':      lm.x * w,
+                        'y':      lm.y * h,
+                        'score':  1.0,
+                        'region': 'hands',
                     })
 
         keypoints = np.concatenate([left_kp, right_kp], axis=0)  # (42, 3)
         return keypoints, skeleton_points
 
     def _preprocess_frame(self, keypoints: np.ndarray) -> np.ndarray:
-        """
-        Normalize a single frame's keypoints.
-        keypoints: (42, 3) → returns (126,)
-        """
         kp = keypoints.copy()
-
         for hand_start, wrist_idx in [(0, 0), (21, 21)]:
             hand  = kp[hand_start:hand_start + self.NUM_HAND_KP, :2]
             wrist = kp[wrist_idx, :2]
@@ -184,8 +169,7 @@ class InferencePipelineMP:
                 scale  = max(np.abs(hand).max(), 1e-6)
                 hand  /= scale
                 kp[hand_start:hand_start + self.NUM_HAND_KP, :2] = hand
-
-        return kp.flatten().astype(np.float32)  # (126,)
+        return kp.flatten().astype(np.float32)
 
     def _classify_window(self, window: np.ndarray, idx_to_word: dict):
         x = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -194,7 +178,7 @@ class InferencePipelineMP:
             probs    = torch.softmax(logits, dim=-1)[0]
             top_idx  = probs.argmax().item()
             top_conf = probs[top_idx].item()
-        word = idx_to_word.get(top_idx, "UNKNOWN")
+        word = idx_to_word.get(top_idx, 'UNKNOWN')
         return word, top_conf
 
     def _check_vote(self):

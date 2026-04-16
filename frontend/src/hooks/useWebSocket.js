@@ -13,13 +13,15 @@ export function useWebSocket(wsUrl, stream, onMessage) {
   const wsRef          = useRef(null);
   const canvasRef      = useRef(document.createElement("canvas"));
   const intervalRef    = useRef(null);
+  const streamRef      = useRef(stream);
+  streamRef.current = stream; // always reflects the latest stream without stale closures
 
   // ── Send frames from stream over WebSocket ──────────────────────────────────
   const startSendingFrames = useCallback(() => {
-    if (!stream) return;
+    if (!streamRef.current) return;
 
     const video = document.createElement("video");
-    video.srcObject = stream;
+    video.srcObject = streamRef.current;
     video.play();
 
     const canvas = canvasRef.current;
@@ -34,7 +36,7 @@ export function useWebSocket(wsUrl, stream, onMessage) {
       const base64  = dataUrl.split(",")[1];
       wsRef.current.send(JSON.stringify({ frame: base64 }));
     }, FRAME_INTERVAL_MS);
-  }, [stream]);
+  }, []);
 
   // ── Connect ─────────────────────────────────────────────────────────────────
   const connect = useCallback(() => {
