@@ -3,11 +3,15 @@ backend/main.py
 ---------------
 FastAPI application entry point.
 
+Supports two models via MODEL_TYPE env variable:
+  MODEL_TYPE=rtmpose  → uses InferencePipeline (RTMPose)
+  MODEL_TYPE=mediapipe → uses InferencePipelineMP (MediaPipe)  ← default
+
 Endpoints:
-  WS  /ws/predict    — WebSocket: receives frames, returns predictions
-  GET /api/health    — Health check
-  GET /api/model-info — Model metadata
-  GET /api/signs     — List of all 100 supported signs
+  WS  /ws/predict      — WebSocket: receives frames, returns predictions
+  GET /api/health      — Health check
+  GET /api/model-info  — Model metadata
+  GET /api/signs       — List of all 100 supported signs
 
 Run:
   uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
@@ -18,15 +22,12 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.inference import InferencePipeline
 from backend.websocket_handler import websocket_endpoint
 
 load_dotenv()
-
-# ─── App Setup ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="ASL Sign Language Translator API",
@@ -36,46 +37,67 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Startup: load model once ─────────────────────────────────────────────────
+# ─── Startup ──────────────────────────────────────────────────────────────────
 
-pipeline: InferencePipeline = None
+pipeline = None
 
 @app.on_event("startup")
 async def startup_event():
     global pipeline
-    checkpoint = os.getenv("MODEL_CHECKPOINT", "models/checkpoints/best_model.pth")
+
+    model_type  = os.getenv("MODEL_TYPE", "mediapipe").lower()
     num_classes = int(os.getenv("NUM_CLASSES", "100"))
-    pipeline = InferencePipeline(
-        checkpoint_path=checkpoint,
-        num_classes=num_classes,
-        conf_threshold=float(os.getenv("CONFIDENCE_THRESHOLD", "0.6")),
-    )
-    print("[startup] Inference pipeline ready")
+    conf        = float(os.getenv("CONFIDENCE_THRESHOLD", "0.6"))
+
+    if model_type == "rtmpose":
+        from backend.inference import InferencePipeline
+        checkpoint = os.getenv("MODEL_CHECKPOINT", "models/checkpoints/best_model.pth")
+        pipeline   = InferencePipeline(
+            checkpoint_path=checkpoint,
+            num_classes=num_classes,
+            conf_threshold=conf,
+        )
+        print("[startup] RTMPose pipeline ready")
+    else:
+        from backend.inference_mp import InferencePipelineMP
+        checkpoint = os.getenv("MODEL_CHECKPOINT_MP", "models/checkpoints_mp/best_model_mp.pth")
+        pipeline   = InferencePipelineMP(
+            checkpoint_path=checkpoint,
+            num_classes=num_classes,
+            conf_threshold=conf,
+        )
+        print("[startup] MediaPipe pipeline ready")
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "model_loaded": pipeline is not None}
+    return {
+        "status":       "ok",
+        "model_loaded": pipeline is not None,
+        "model_type":   os.getenv("MODEL_TYPE", "mediapipe"),
+    }
 
 
 @app.get("/api/model-info")
 async def model_info():
     if pipeline is None:
         return {"error": "model not loaded"}
+    model_type = os.getenv("MODEL_TYPE", "mediapipe")
     return {
-        "num_classes":   pipeline.num_classes,
-        "window_size":   32,
-        "feature_dim":   399,
-        "architecture":  "ASLTransformer (encoder-only, 4 layers, 8 heads, d=256)",
-        "parameters":    "~2.5M",
+        "model_type":   model_type,
+        "num_classes":  pipeline.num_classes,
+        "window_size":  32,
+        "feature_dim":  126 if model_type == "mediapipe" else 399,
+        "architecture": "ASLTransformer (4 layers, 8 heads, d=256)",
+        "parameters":   "~2.5M",
     }
 
 
