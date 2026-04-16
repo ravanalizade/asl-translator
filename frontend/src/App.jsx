@@ -49,7 +49,7 @@ export default function App() {
 
   return (
     <div className={darkMode ? "dark" : ""}>
-      <div className="min-h-screen bg-gray-950 text-white flex flex-col">
+      <div className={`min-h-screen ${darkMode ? "bg-gray-950 text-white" : "bg-white text-gray-900"} flex flex-col`}>
         <Header darkMode={darkMode} onToggleDark={() => setDarkMode(d => !d)} />
 
         <main className="flex flex-1 gap-4 p-4">
